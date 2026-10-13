@@ -78,10 +78,14 @@ struct Preview {
         if(!selected)for(auto& slot:slots)if(!slot.device.load()){selected=&slot;break;}
         if(!selected)return;auto& slot=*selected;
         if(event.flags&sn::Flags::processed){
-            if(event.kind!=sn::Kind::motion)return;
+            // Only mirror output for a slot already claimed by this device's raw frames.
+            if(event.kind!=sn::Kind::motion||slot.device.load()!=event.device)return;
+            bool moved=false;for(int i=0;i<6;++i)moved|=slot.mapped[i].load()!=event.axes[i];
+            uint64_t stamp=event.received?event.received:sn::now(),previous=slot.mappedTimestamp.load();
             slot.version.fetch_add(1,std::memory_order_acq_rel);
-            for(int i=0;i<6;++i)slot.mapped[i]=event.axes[i];slot.mappedTimestamp=event.received?event.received:sn::now();
+            for(int i=0;i<6;++i)slot.mapped[i]=event.axes[i];slot.mappedTimestamp=stamp;
             slot.version.fetch_add(1,std::memory_order_release);
+            if(moved||!previous||stamp-previous>250000000)changed();
             return;
         }
         uint32_t identity=uint32_t(event.vendor)<<16|event.product;

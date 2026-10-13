@@ -64,9 +64,10 @@ final class TestRenderer: NSObject, SCNSceneRendererDelegate {
     func configure(device: UInt32, profile: Profile) {
         lock.lock()
         let oldDevice = self.device, oldGain = gain, oldDeadzone = deadzone, oldDominant = dominant
-        self.device = device;dominant = profile.dominant
+        self.device = device;dominant = profile.lock == .dominant
         for i in 0..<6 {
-            gain[i] = ((i < 3 && !profile.translation) || (i >= 3 && !profile.rotation)) ? 0 : profile.gain[i] * (profile.invert[i] ? -1 : 1)
+            let off = !profile.enabled[i] || (i < 3 && !profile.translation) || (i >= 3 && !profile.rotation)
+            gain[i] = off ? 0 : profile.gain[i] * (profile.invert[i] ? -1 : 1)
             deadzone[i] = profile.deadzone[i]
         }
         let changed = oldDevice != device || oldGain != gain || oldDeadzone != deadzone || oldDominant != dominant
@@ -90,6 +91,15 @@ final class TestRenderer: NSObject, SCNSceneRendererDelegate {
     private func axes() -> SIMD8<Double> {
         lock.lock();let device = self.device, gain = self.gain, deadzone = self.deadzone, dominant = self.dominant;lock.unlock()
         var values = SIMD8<Double>.zero;var buttons: UInt32 = 0
+        // Prefer the service's post-mapping stream: it already applied the
+        // profile (dead zones, curves, gain, inversion, matrix, locks and
+        // toggles) and is zero when stale, so the car moves exactly like the
+        // real output. Older services send no mapped frames; approximate then.
+        let mapped = withUnsafeMutableBytes(of: &values) {bytes in
+            previewReadMapped(device, bytes.bindMemory(to: Double.self).baseAddress!)
+        }
+        if mapped {return values}
+        values = .zero
         withUnsafeMutableBytes(of: &values) {bytes in
             _ = previewRead(device, bytes.bindMemory(to: Double.self).baseAddress!, &buttons)
         }

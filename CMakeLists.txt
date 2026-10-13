@@ -86,7 +86,8 @@ if(AXIAL_BUILD_APP)
   set(axial_app_sources
     app/Axial.swift app/AppLifecycle.swift app/AppInstance.swift app/AxisMeter.swift app/DeviceCatalog.swift
     app/Diagnostics.swift app/NativeControls.swift app/SceneTest.swift app/ServiceClient.swift
-    app/ServiceLifecycle.swift app/SessionLog.swift app/TestModel.swift app/TestNavigation.swift app/WebSetup.swift)
+    app/ServiceLifecycle.swift app/SessionLog.swift app/TestModel.swift app/TestNavigation.swift app/WebSetup.swift
+    app/ProfileModel.swift app/LiveView.swift app/MappingView.swift app/TuningView.swift app/ButtonsView.swift app/ProfilesView.swift app/SettingsView.swift)
   include(cmake/Resources.cmake)
   add_executable(Axial MACOSX_BUNDLE app/AxialApp.swift ${axial_app_sources} ${axial_resources})
   axial_swift_platform(Axial)

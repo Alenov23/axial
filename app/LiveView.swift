@@ -71,7 +71,7 @@ enum PuckGeometry {
         return node
     }
     static func lights(_ scene: SCNScene) {
-        let key = SCNNode();key.light = SCNLight();key.light!.type = .directional;key.light!.intensity = 900
+        let key = SCNNode();key.light = SCNLight();key.light!.type = .directional;key.light!.intensity = 650
         key.light!.castsShadow = true;key.light!.shadowRadius = 6;key.light!.shadowColor = NSColor.black.withAlphaComponent(0.45)
         key.eulerAngles = SCNVector3(-1.0, 0.6, 0);scene.rootNode.addChildNode(key)
         let fill = SCNNode();fill.light = SCNLight();fill.light!.type = .ambient;fill.light!.intensity = 380
@@ -86,7 +86,7 @@ enum PuckGeometry {
         scene.rootNode.addChildNode(c);return c
     }
     static func floor(_ scene: SCNScene) {
-        let f = SCNFloor();f.reflectivity = 0.08;f.materials = [material(NSColor(white: 0.13, alpha: 1), metal: 0, rough: 0.9)]
+        let f = SCNFloor();f.reflectivity = 0.04;f.materials = [material(NSColor(white: 0.08, alpha: 1), metal: 0, rough: 1)]
         let n = SCNNode(geometry: f);n.position.y = -0.2;scene.rootNode.addChildNode(n)
     }
 }
@@ -108,7 +108,7 @@ final class PhysicalPuckScene: NSObject, SCNSceneRendererDelegate {
         super.init()
         scene.background.contents = NSColor.clear
         PuckGeometry.lights(scene);PuckGeometry.floor(scene)
-        cameraNode = PuckGeometry.camera(scene)
+        cameraNode = PuckGeometry.camera(scene, distance: 4.3, height: 2.9)
         let base = SCNBox(width: 2.1, height: 0.22, length: 1.45, chamferRadius: 0.1)
         base.materials = [PuckGeometry.material(NSColor(white: 0.16, alpha: 1), metal: 0.1, rough: 0.55)]
         let baseNode = SCNNode(geometry: base);baseNode.position.y = -0.09;scene.rootNode.addChildNode(baseNode)

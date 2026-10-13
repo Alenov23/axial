@@ -80,6 +80,10 @@ struct AppCommand: Codable, Identifiable {var id: String; var label: String}
             }
         } catch {message = "Could not update service startup: \(error.localizedDescription)"}
         launchAtLogin = SMAppService.mainApp.status == .enabled
+        // Lets tools/live-shots.sh switch panes for the live HTML preview.
+        DistributedNotificationCenter.default().addObserver(forName: Notification.Name("pro.jest.Axial.showTab"), object: nil, queue: .main) {[weak self] note in
+            MainActor.assumeIsolated {if let text = note.object as? String, let tab = Int(text), SettingsTab(rawValue: tab) != nil {self?.tab = tab}}
+        }
         startPolling()
     }
     func startPolling() {
@@ -136,13 +140,13 @@ struct AppCommand: Codable, Identifiable {var id: String; var label: String}
         // Only the Motion and Buttons panes display these values. Publishing a
         // whole Status on every report needlessly invalidates the settings tree
         // during CAD navigation and the independently driven SceneKit preview.
-        guard tab == 0 || tab == 1, let application = NSApp, !application.isHidden,
+        guard tab == SettingsTab.buttons.rawValue || tab == SettingsTab.live.rawValue, let application = NSApp, !application.isHidden,
               application.windows.contains(where: {$0.isVisible && !$0.isMiniaturized && $0.occlusionState.contains(.visible)}) else {return}
         guard var next = status, let id = selectedDevice, let index = next.devices.firstIndex(where: {$0.id == id}) else {return}
         var axes = [Double](repeating: 0, count: 6);var buttons: UInt32 = 0
         guard previewRead(UInt32(id), &axes, &buttons) else {return}
         let values = axes.map(Int.init)
-        if (tab == 0 && next.devices[index].axes != values) || next.devices[index].buttons != buttons {
+        if (tab == SettingsTab.live.rawValue && next.devices[index].axes != values) || next.devices[index].buttons != buttons {
             next.devices[index].axes = values;next.devices[index].buttons = buttons;status = next
         }
     }

@@ -6,6 +6,27 @@ An open-source 3Dconnexion SpaceMouse and SpaceExplorer driver. Axial provides
 six-axis navigation through native compatibility frameworks for applications 
 such as Autodesk Fusion, PrusaSlicer, and FreeCAD.
 
+## SpaceControl fork
+
+This branch (`spacecontrol`) is a fork of [Axial by consi](https://github.com/consi/axial).
+It is based on Axial's MIT-licensed code, and the original copyright and license are
+retained. The fork adds a mapping layer on top of the driver:
+
+- A 6×6 axis-mixing matrix with drag and drop: swap, invert, disable or mix axes,
+  including translation ↔ rotation.
+- Live 3D views of the physical device and of the mapped output.
+- Per-axis tuning: sensitivity, rescaled deadzone, response curves (linear, expo,
+  power, S-curve), smoothing and a calibration wizard.
+- Axis locks: dominant axis, or translate-or-rotate.
+- Button assignments: shortcuts, macros, application commands, driver actions, and
+  actions that open a URL or app or run a shell command.
+- Profiles that switch automatically with the frontmost app (Fusion, OrcaSlicer,
+  Blender…), with import and export as `.spacecontrol.json`.
+
+The event ABI, the compatibility frameworks and existing `settings.json` files are
+unchanged. See [docs/spacecontrol.md](docs/spacecontrol.md) for the user guide,
+the processing order, the profile schema and API additions.
+
 ## Why Axial exists
 
 3Dconnexion stopped supporting my still-working SpaceExplorer with a current
