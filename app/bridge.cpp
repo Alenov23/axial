@@ -1,4 +1,5 @@
 #include "axial/transport.hpp"
+#include "axial/mapping.hpp"
 #include <cstdlib>
 #include <cstring>
 #include <atomic>
@@ -32,6 +33,9 @@ struct PreviewSlot {
     std::atomic<uint64_t> version{0},timestamp{0};
     std::atomic<uint32_t> device{0},buttons{0},identity{0};
     std::array<std::atomic<int16_t>,6> axes{};
+    // Post-mapping output mirrored by the service (Flags::processed frames).
+    std::atomic<uint64_t> mappedTimestamp{0};
+    std::array<std::atomic<int16_t>,6> mapped{};
 };
 struct ButtonLog {uint64_t timestamp=0;uint32_t device=0,changed=0,buttons=0,reason=0,identity=0;};
 struct Preview {
@@ -60,7 +64,7 @@ struct Preview {
     void clear(uint32_t device=0,uint32_t reason=uint32_t(sn::Kind::reset)){
         for(auto& slot:slots)if(slot.device.load()&&(!device||slot.device.load()==device)){
             if(reason==uint32_t(sn::Kind::removed))append(sn::now(),slot.device.load(),slot.buttons.load(),0,reason,slot.identity.load());
-            slot.version.fetch_add(1,std::memory_order_acq_rel);for(auto& axis:slot.axes)axis=0;slot.timestamp=0;
+            slot.version.fetch_add(1,std::memory_order_acq_rel);for(auto& axis:slot.axes)axis=0;for(auto& axis:slot.mapped)axis=0;slot.timestamp=0;slot.mappedTimestamp=0;
             if(reason==uint32_t(sn::Kind::removed)){slot.buttons=0;slot.device=0;slot.identity=0;}
             slot.version.fetch_add(1,std::memory_order_release);
         }
@@ -73,6 +77,13 @@ struct Preview {
         for(auto& slot:slots)if(slot.device.load()==event.device){selected=&slot;break;}
         if(!selected)for(auto& slot:slots)if(!slot.device.load()){selected=&slot;break;}
         if(!selected)return;auto& slot=*selected;
+        if(event.flags&sn::Flags::processed){
+            if(event.kind!=sn::Kind::motion)return;
+            slot.version.fetch_add(1,std::memory_order_acq_rel);
+            for(int i=0;i<6;++i)slot.mapped[i]=event.axes[i];slot.mappedTimestamp=event.received?event.received:sn::now();
+            slot.version.fetch_add(1,std::memory_order_release);
+            return;
+        }
         uint32_t identity=uint32_t(event.vendor)<<16|event.product;
         if(!identity)identity=slot.identity.load();
         if(event.kind==sn::Kind::buttons)append(event.received,event.device,slot.buttons.load()^event.buttons,event.buttons,uint32_t(event.kind),identity);
@@ -88,7 +99,7 @@ struct Preview {
         if(running.exchange(true))return;
         worker=std::thread([this]{pthread_setname_np("Axial live preview");pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE,0);
             while(running.load()){
-                int connected=sn::openEvents(sn::Flags::monitor);
+                int connected=sn::openEvents(sn::Flags::monitor|sn::Flags::mapped);
                 if(connected<0){for(int i=0;i<10&&running;++i)std::this_thread::sleep_for(std::chrono::milliseconds(100));continue;}
                 {std::lock_guard lock(lifecycle);fd=connected;if(!running)shutdown(fd,SHUT_RDWR);}
                 sn::Event event;
@@ -131,4 +142,21 @@ extern "C" bool AxialPreviewPopLog(uint64_t* timestamp,uint32_t* device,uint32_t
     size_t r=preview.read.load(std::memory_order_relaxed);if(r==preview.write.load(std::memory_order_acquire))return false;
     const auto& event=preview.log[r%preview.log.size()];*timestamp=event.timestamp;*device=event.device;*changed=event.changed;*buttons=event.buttons;*reason=event.reason;*identity=event.identity;
     preview.read.store(r+1,std::memory_order_release);return true;
+}
+// Mapped output for the same device; zero when stale (device at rest).
+extern "C" bool AxialPreviewReadMapped(uint32_t device,double* axes){
+    if(!axes)return false;
+    for(auto& slot:preview.slots)if(slot.device.load()&&(!device||slot.device.load()==device)){
+        for(int attempt=0;attempt<3;++attempt){uint64_t version=slot.version.load(std::memory_order_acquire);if(version&1)continue;
+            uint64_t timestamp=slot.mappedTimestamp.load();for(int i=0;i<6;++i)axes[i]=slot.mapped[i].load();
+            if(slot.version.load(std::memory_order_acquire)==version){if(!timestamp||sn::now()-timestamp>250000000)for(int i=0;i<6;++i)axes[i]=0;return timestamp!=0;}
+        }
+    }
+    for(int i=0;i<6;++i)axes[i]=0;return false;
+}
+// The exact service shaping function, for drawing response curves in the UI.
+extern "C" double AxialShapeInput(double raw,double sensitivity,double deadzone,uint32_t curve,double amount,double center,double range){
+    sn::InputTuning t;t.sensitivity=float(sensitivity);t.deadzone=float(deadzone);t.curve=sn::Curve(std::min<uint32_t>(curve,3));
+    t.curveAmount=float(amount);t.center=float(center);t.range=float(range);
+    return sn::shapeInput(float(raw),t);
 }

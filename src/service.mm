@@ -5,6 +5,7 @@
 #include "axial/keys.hpp"
 #include "axial/application.hpp"
 #include "axial/web.hpp"
+#include "axial/mapping.hpp"
 #include <atomic>
 #include <cstdio>
 #include <memory>
@@ -18,13 +19,20 @@
 
 using namespace sn;
 namespace {
-enum class Action : uint8_t {none,dominant,translation,rotation,faster,slower,fit};
+// Order is the wire/JSON order of action names; append only.
+enum class Action : uint8_t {none,dominant,translation,rotation,faster,slower,fit,group,pause,resetSpeed};
+const char* const actionNames[]={"","dominant","translation","rotation","faster","slower","fit","group","pause","resetSpeed"};
+struct MacroStep {enum class Type:uint8_t{key,text,delay}; Type type=Type::key;int key=0;uint64_t modifiers=0;uint32_t delay=0;std::string text;};
 struct Profile {
-    Settings motion;
+    Mapping motion;
+    std::array<float,6> configuredGain{1,1,1,1,1,1};
     bool led=true;
     std::array<int,32> keys;
     std::array<uint64_t,32> modifiers{};
     std::array<Action,32> actions{};
+    std::array<std::vector<MacroStep>,32> macros{};
+    std::array<std::string,32> open{},shell{};
+    uint32_t blocked=0; // buttons withheld from applications (custom assignment owns them)
     Profile(){keys.fill(-1);}
 };
 struct Configuration { std::map<std::string,Profile> profiles;WebConfiguration web; };
@@ -34,7 +42,7 @@ struct Peer {
     pid_t pid=0;
     sn::ProcessIdentity identity;
     bool foreground=false;
-    bool registered=false, observe=false, injecting=false, writeActive=false;
+    bool registered=false, observe=false, injecting=false, writeActive=false, mapped=false;
     Event incoming{};
     size_t readOffset=0,writeOffset=0;
     EventQueue<256> queue;
@@ -54,6 +62,8 @@ struct HID {
     IOHIDDeviceRef device=nullptr;
     Decoder decoder;
     Profile profile;
+    Profile preview; // profile mirrored to mapped monitors (the one being edited)
+    Processor processor, previewProcessor;
     uint32_t previousButtons=0;
     uint32_t suppressedButtons=0;
     std::shared_ptr<LEDOutput> led;
@@ -73,8 +83,11 @@ std::array<Peer,32> peers;
 std::array<HID,16> hidDevices;
 std::array<Event,16> virtualDevices{};
 std::array<uint32_t,16> virtualButtonState{};
+std::array<Processor,16> virtualProcessors,virtualPreviewProcessors;
+Processor fallbackProcessor,fallbackPreviewProcessor;
 std::unique_ptr<Configuration> configuration;
-Profile activeProfile;
+Profile activeProfile,activePreview;
+std::string activeKey,previewKey;
 std::string foregroundBundle;
 pid_t foregroundPID=0;
 sn::ProcessIdentity foregroundIdentity;
@@ -84,6 +97,7 @@ void resolveForeground(Peer& peer) {
 bool mockMode=false;
 uint64_t reports=0,overflows=0,rejected=0;
 dispatch_queue_t keyQueue;
+dispatch_queue_t macroQueue;
 dispatch_queue_t outputQueue;
 dispatch_source_t keySource;
 struct KeyWork {uint32_t device=0,buttons=0;bool release=false;std::array<int,32> keys{};std::array<uint64_t,32> modifiers{};};
@@ -111,6 +125,53 @@ void setLED(HID& hid,bool enabled) {
 void postKey(int key,bool down,uint64_t modifiers){
     CGEventRef e=CGEventCreateKeyboardEvent(nullptr,CGKeyCode(key),down);
     if(e){CGEventSetFlags(e,CGEventFlags(modifiers));CGEventPost(kCGHIDEventTap,e);CFRelease(e);}
+}
+// Macros press real modifier keys around each chord; some apps (Blender, Fusion)
+// ignore flag-only modifiers on synthetic key events.
+void postChord(int key,uint64_t modifiers){
+    struct Modifier {uint64_t flag;CGKeyCode code;};
+    static constexpr Modifier order[]={{kCGEventFlagMaskControl,59},{kCGEventFlagMaskAlternate,58},{kCGEventFlagMaskShift,56},{kCGEventFlagMaskCommand,55}};
+    uint64_t held=0;
+    for(const auto& m:order)if(modifiers&m.flag){held|=m.flag;
+        if(CGEventRef e=CGEventCreateKeyboardEvent(nullptr,m.code,true)){CGEventSetFlags(e,CGEventFlags(held));CGEventPost(kCGHIDEventTap,e);CFRelease(e);}}
+    postKey(key,true,modifiers);postKey(key,false,modifiers);
+    for(auto it=std::rbegin(order);it!=std::rend(order);++it)if(modifiers&it->flag){held&=~it->flag;
+        if(CGEventRef e=CGEventCreateKeyboardEvent(nullptr,it->code,false)){CGEventSetFlags(e,CGEventFlags(held));CGEventPost(kCGHIDEventTap,e);CFRelease(e);}}
+}
+void typeText(const std::string& text){
+    NSString* string=[NSString stringWithUTF8String:text.c_str()];if(!string)return;
+    for(NSUInteger i=0;i<string.length;){
+        NSRange range=[string rangeOfComposedCharacterSequenceAtIndex:i];
+        unichar buffer[8];NSUInteger length=std::min<NSUInteger>(range.length,8);[string getCharacters:buffer range:NSMakeRange(range.location,length)];
+        for(bool down:{true,false})if(CGEventRef e=CGEventCreateKeyboardEvent(nullptr,0,down)){CGEventKeyboardSetUnicodeString(e,length,buffer);CGEventPost(kCGHIDEventTap,e);CFRelease(e);}
+        i=NSMaxRange(range);usleep(2000);
+    }
+}
+void runMacro(std::vector<MacroStep> steps){
+    if(steps.empty())return;
+    dispatch_async(macroQueue,^{
+        if(!AXIsProcessTrusted())return;
+        for(const auto& s:steps){
+            if(s.type==MacroStep::Type::key){postChord(s.key,s.modifiers);usleep(4000);}
+            else if(s.type==MacroStep::Type::text)typeText(s.text);
+            else usleep(useconds_t(std::min<uint32_t>(s.delay,10000))*1000);
+        }
+    });
+}
+void launch(const std::string& open,const std::string& shell){
+    if(!open.empty()){NSString* target=@(open.c_str());
+        dispatch_async(dispatch_get_main_queue(),^{
+            NSURL* url=[target containsString:@"://"]?[NSURL URLWithString:target]:[NSURL fileURLWithPath:target.stringByExpandingTildeInPath];
+            if(url)[NSWorkspace.sharedWorkspace openURL:url];
+        });
+    }
+    if(!shell.empty()){NSString* command=@(shell.c_str());
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY,0),^{
+            NSTask* task=[NSTask new];task.executableURL=[NSURL fileURLWithPath:@"/bin/sh"];task.arguments=@[@"-c",command];
+            task.standardInput=NSFileHandle.fileHandleWithNullDevice;task.standardOutput=NSFileHandle.fileHandleWithNullDevice;task.standardError=NSFileHandle.fileHandleWithNullDevice;
+            [task launchAndReturnError:nil];
+        });
+    }
 }
 void clearHeld(uint32_t device=0){
     heldKeys.release(device,postKey);
@@ -160,61 +221,101 @@ void flush(Peer& p) {
 }
 void enqueue(Peer& p,const Event& e) {
     // Never replace a partly written front frame: append a barrier if necessary.
-    if(p.writeOffset && p.queue.size()==1) {
-        // A stream short-write is exceptionally rare for 64 bytes. Disconnect rather
-        // than corrupt an ABI frame or deliver stale partially rewritten motion.
-        ++overflows;closePeer(p);return;
-    }
-    if(!p.queue.push(e)){++overflows;closePeer(p);return;}
+    // A partly written front frame is never replaced; push appends instead.
+    if(!p.queue.push(e,p.writeOffset!=0)){++overflows;closePeer(p);return;}
     flush(p);
+}
+void applyAction(Profile& profile,Action action) {
+    auto& m=profile.motion;
+    switch(action){
+        case Action::dominant:m.lock=m.lock==Lock::dominant?Lock::none:Lock::dominant;break;
+        case Action::group:m.lock=m.lock==Lock::group?Lock::none:Lock::group;break;
+        case Action::translation:m.translation=!m.translation;break;
+        case Action::rotation:m.rotation=!m.rotation;break;
+        case Action::pause:{bool on=m.translation||m.rotation;m.translation=m.rotation=!on;break;}
+        case Action::faster:for(auto& gain:m.gain)gain=std::min(20.f,gain*1.25f);break;
+        case Action::slower:for(auto& gain:m.gain)gain=std::max(.01f,gain/1.25f);break;
+        case Action::resetSpeed:m.gain=profile.configuredGain;break;
+        default:break;
+    }
 }
 void route(const Event& raw) {
     ++reports;
     Profile* selected=&activeProfile;
+    Profile* preview=&activePreview;
+    Processor* processor=&fallbackProcessor;
+    Processor* previewProcessor=&fallbackPreviewProcessor;
     uint32_t suppressed=0;
     uint32_t ignoredPrevious=0;uint32_t* previous=&ignoredPrevious;
-    if(mockMode)for(size_t i=0;i<virtualDevices.size();++i)if(virtualDevices[i].device==raw.device){previous=&virtualButtonState[i];break;}
-    for(auto& h:hidDevices)if(h.device&&h.decoder.state.device==raw.device){selected=&h.profile;previous=&h.previousButtons;if(raw.kind==Kind::buttons)h.suppressedButtons&=raw.buttons;suppressed=h.suppressedButtons;break;}
+    if(mockMode)for(size_t i=0;i<virtualDevices.size();++i)if(virtualDevices[i].device==raw.device){previous=&virtualButtonState[i];processor=&virtualProcessors[i];previewProcessor=&virtualPreviewProcessors[i];break;}
+    for(auto& h:hidDevices)if(h.device&&h.decoder.state.device==raw.device){selected=&h.profile;preview=&h.preview;processor=&h.processor;previewProcessor=&h.previewProcessor;previous=&h.previousButtons;if(raw.kind==Kind::buttons)h.suppressedButtons&=raw.buttons;suppressed=h.suppressedButtons;break;}
     if(raw.kind==Kind::buttons){
         uint32_t pressed=raw.buttons&~*previous;*previous=raw.buttons;
-        for(int i=0;i<32;++i)if(pressed&(1u<<i))switch(selected->actions[i]){
-            case Action::dominant:selected->motion.dominant=!selected->motion.dominant;break;
-            case Action::translation:selected->motion.translation=!selected->motion.translation;break;
-            case Action::rotation:selected->motion.rotation=!selected->motion.rotation;break;
-            case Action::faster:for(auto& gain:selected->motion.gain)gain=std::min(20.f,gain*1.25f);break;
-            case Action::slower:for(auto& gain:selected->motion.gain)gain=std::max(.01f,gain/1.25f);break;
-            case Action::fit:{Event command=raw;command.kind=Kind::command;command.flags=0x10000;
+        for(int i=0;i<32;++i)if(pressed&(1u<<i)){
+            Action action=selected->actions[i];
+            if(action==Action::fit){Event command=raw;command.kind=Kind::command;command.flags=0x10000;
                 if(webServer)webServer->receive(command);
-                for(auto& p:peers)if(p.fd>=0&&p.registered&&!p.injecting&&!p.observe&&(mockMode||p.foreground))enqueue(p,command);break;}
-            default:break;
+                for(auto& p:peers)if(p.fd>=0&&p.registered&&!p.injecting&&!p.observe&&(mockMode||p.foreground))enqueue(p,command);
+            } else if(action!=Action::none){
+                applyAction(*selected,action);
+                if(!previewKey.empty()&&preview!=selected)applyAction(*preview,action);
+            }
+            if(!mockMode&&!(suppressed&(1u<<i))){
+                if(!selected->macros[i].empty())runMacro(selected->macros[i]);
+                if(!selected->open[i].empty()||!selected->shell[i].empty())launch(selected->open[i],selected->shell[i]);
+            }
         }
     }
-    Event e=filter(raw,selected->motion);
+    Event e=processor->process(raw,selected->motion);
     e.buttons&=~suppressed;
+    const uint32_t keyButtons=e.buttons;
+    e.buttons&=~selected->blocked; // custom assignments own these buttons
+    bool wantsMapped=false;
+    for(const auto& p:peers)if(p.fd>=0&&p.registered&&p.observe&&p.mapped){wantsMapped=true;break;}
+    Event mapped{};
+    if(wantsMapped&&raw.kind==Kind::motion){
+        // Mirror the real output, or the profile being edited when one is previewed.
+        mapped=previewKey.empty()?e:previewProcessor->process(raw,preview->motion);
+        mapped.flags|=Flags::processed;
+    } else if(!previewKey.empty())previewProcessor->process(raw,preview->motion);
     if(webServer)webServer->receive(e);
     for(auto& p:peers) if(p.fd>=0&&p.registered&&!p.injecting) {
-        if(p.observe) enqueue(p,raw);
+        if(p.observe){enqueue(p,raw);if(p.fd>=0&&p.mapped&&raw.kind==Kind::motion)enqueue(p,mapped);}
         else if(mockMode||p.foreground||raw.kind==Kind::added||raw.kind==Kind::removed||raw.kind==Kind::reset)
             enqueue(p,e);
     }
     if(raw.kind==Kind::buttons&&!mockMode) {
-        KeyWork work;work.device=raw.device;work.buttons=e.buttons;work.keys=selected->keys;work.modifiers=selected->modifiers;submitKeyWork(work);
+        KeyWork work;work.device=raw.device;work.buttons=keyButtons;work.keys=selected->keys;work.modifiers=selected->modifiers;submitKeyWork(work);
     }
     if(raw.kind==Kind::removed||raw.kind==Kind::reset)releaseKeys(raw.device);
 }
 void resetFocus() {for(auto& h:hidDevices)if(h.device)h.suppressedButtons=h.decoder.state.buttons;Event e;e.kind=Kind::reset;e.received=now();route(e);}
+// Resolution order: app@device, app, *@device, *. Returns the matched key.
+std::string resolveProfile(const std::string& bundle,uint16_t vendor,uint16_t product,bool device,Profile& out) {
+    out=Profile{};
+    if(!configuration)return "";
+    std::string candidates[4];size_t count=0;
+    char suffix[16];snprintf(suffix,sizeof(suffix),"@%04x:%04x",vendor,product);
+    if(device)candidates[count++]=bundle+suffix;
+    candidates[count++]=bundle;
+    if(device)candidates[count++]=std::string("*")+suffix;
+    candidates[count++]="*";
+    for(size_t i=0;i<count;++i){auto it=configuration->profiles.find(candidates[i]);if(it!=configuration->profiles.end()){out=it->second;return it->first;}}
+    return "";
+}
+// The settings app previews the exact profile key being edited.
+void resolvePreview(uint16_t vendor,uint16_t product,bool device,const Profile& active,Profile& out) {
+    if(previewKey.empty()||!configuration){out=active;return;}
+    auto it=configuration->profiles.find(previewKey);
+    if(it!=configuration->profiles.end())out=it->second;
+    else resolveProfile(previewKey.substr(0,previewKey.find('@')),vendor,product,device,out);
+}
 void selectProfile() {
-    activeProfile=Profile{};
-    if(!configuration)return;
-    auto it=configuration->profiles.find(foregroundBundle);
-    if(it==configuration->profiles.end())it=configuration->profiles.find("*");
-    if(it!=configuration->profiles.end())activeProfile=it->second;
+    activeKey=resolveProfile(foregroundBundle,0,0,false,activeProfile);
+    resolvePreview(0,0,false,activeProfile,activePreview);
     for(auto& h:hidDevices)if(h.device){
-        h.profile=activeProfile;
-        char suffix[16];snprintf(suffix,sizeof(suffix),"@%04x:%04x",h.decoder.state.vendor,h.decoder.state.product);
-        auto device=configuration->profiles.find(foregroundBundle+suffix);
-        if(device==configuration->profiles.end())device=configuration->profiles.find(std::string("*")+suffix);
-        if(device!=configuration->profiles.end())h.profile=device->second;
+        activeKey=resolveProfile(foregroundBundle,h.decoder.state.vendor,h.decoder.state.product,true,h.profile);
+        resolvePreview(h.decoder.state.vendor,h.decoder.state.product,true,h.profile,h.preview);
         setLED(h,h.profile.led);
     }
 }
@@ -252,7 +353,7 @@ void added(void*,IOReturn result,void*,IOHIDDeviceRef d) {
     int vid=property(d,CFSTR(kIOHIDVendorIDKey)),pid=property(d,CFSTR(kIOHIDProductIDKey));
     if(!deviceSpec(vid,pid)||!multiAxis(d))return;
     for(auto& h:hidDevices)if(!h.device) {
-        h.device=d;CFRetain(d);h.decoder=Decoder{};h.previousButtons=0;h.suppressedButtons=0;
+        h.device=d;CFRetain(d);h.decoder=Decoder{};h.previousButtons=0;h.suppressedButtons=0;h.processor.reset();h.previewProcessor.reset();
         h.led.reset();h.requestedLED=-1;
         NSArray* elements=CFBridgingRelease(IOHIDDeviceCopyMatchingElements(d,nullptr,kIOHIDOptionsTypeNone));
         for(id item in elements){auto element=(__bridge IOHIDElementRef)item;
@@ -290,7 +391,7 @@ void readPeer(Peer& p) {
         if(!valid(e)){closePeer(p);return;}
         if(!p.registered) {
             if(e.kind!=Kind::hello){closePeer(p);return;}
-            p.registered=true;p.observe=e.flags&Flags::monitor;p.injecting=e.flags&Flags::replay;
+            p.registered=true;p.observe=e.flags&Flags::monitor;p.injecting=e.flags&Flags::replay;p.mapped=p.observe&&(e.flags&Flags::mapped);
             if(p.injecting&&!mockMode){closePeer(p);return;}
             if(!p.injecting){
                 for(const auto& h:hidDevices)if(h.device){Event a=h.decoder.state;a.kind=Kind::added;enqueue(p,a);if(p.fd<0)return;}
@@ -302,7 +403,7 @@ void readPeer(Peer& p) {
                 auto v=std::find_if(virtualDevices.begin(),virtualDevices.end(),[&](const auto& item){return item.device==e.device;});
                 if(v==virtualDevices.end()&&e.kind!=Kind::removed)v=std::find_if(virtualDevices.begin(),virtualDevices.end(),[](const auto& item){return !item.device;});
                 if(v!=virtualDevices.end()){
-                    if(!v->device||e.kind==Kind::added||e.kind==Kind::removed)virtualButtonState[size_t(v-virtualDevices.begin())]=0;
+                    if(!v->device||e.kind==Kind::added||e.kind==Kind::removed){size_t index=size_t(v-virtualDevices.begin());virtualButtonState[index]=0;virtualProcessors[index].reset();virtualPreviewProcessors[index].reset();}
                     *v=e.kind==Kind::removed?Event{}:e;
                 }
             }
@@ -335,6 +436,86 @@ void acceptEvents(int listenerFD) {
 }
 bool number(id x){return [x isKindOfClass:NSNumber.class]&&CFGetTypeID((__bridge CFTypeRef)x)!=CFBooleanGetTypeID()&&std::isfinite([x doubleValue]);}
 bool boolean(id x){return x&&CFGetTypeID((__bridge CFTypeRef)x)==CFBooleanGetTypeID();}
+// Optional fixed-size numeric array within [low, high].
+bool numbers(id value,double low,double high,std::array<float,6>& out){
+    if(!value)return true;
+    if(![value isKindOfClass:NSArray.class]||[value count]!=6)return false;
+    for(int i=0;i<6;++i){id x=value[i];if(!number(x))return false;double v=[x doubleValue];if(v<low||v>high)return false;out[size_t(i)]=float(v);}
+    return true;
+}
+bool booleans(id value,std::array<bool,6>& out){
+    if(!value)return true;
+    if(![value isKindOfClass:NSArray.class]||[value count]!=6)return false;
+    for(int i=0;i<6;++i){if(!boolean(value[i]))return false;out[size_t(i)]=[value[i] boolValue];}
+    return true;
+}
+bool text(id value,NSUInteger limit){return !value||([value isKindOfClass:NSString.class]&&[value length]<=limit);}
+bool parseProfile(NSDictionary* v,Profile& p){
+    auto& m=p.motion;
+    std::array<float,6> deadzone{},sensitivity{1,1,1,1,1,1},amount{},smoothing{},center{},range{};range.fill(nominalRange);
+    if(!numbers(v[@"gain"],0,20,m.gain)||!numbers(v[@"deadzone"],0,1000,deadzone)||!booleans(v[@"invert"],m.invert)||
+       !numbers(v[@"sensitivity"],0,10,sensitivity)||!numbers(v[@"curveAmount"],0,1,amount)||!numbers(v[@"smoothing"],0,500,smoothing)||
+       !numbers(v[@"center"],-1000,1000,center)||!numbers(v[@"range"],10,2000,range)||!booleans(v[@"enabled"],m.enabled))return false;
+    p.configuredGain=m.gain;
+    for(int i=0;i<6;++i){auto& t=m.input[size_t(i)];t.deadzone=deadzone[size_t(i)];t.sensitivity=sensitivity[size_t(i)];t.curveAmount=amount[size_t(i)];
+        t.smoothing=smoothing[size_t(i)];t.center=center[size_t(i)];t.range=range[size_t(i)];}
+    if(id curves=v[@"curve"]){
+        if(![curves isKindOfClass:NSArray.class]||[curves count]!=6)return false;
+        NSArray* names=@[@"linear",@"expo",@"power",@"scurve"];
+        for(int i=0;i<6;++i){id name=curves[i];if(![name isKindOfClass:NSString.class])return false;
+            NSUInteger index=[names indexOfObject:name];if(index==NSNotFound)return false;m.input[size_t(i)].curve=Curve(index);}
+    }
+    if(id matrix=v[@"matrix"]){
+        if(![matrix isKindOfClass:NSArray.class]||[matrix count]!=6)return false;
+        for(int o=0;o<6;++o){std::array<float,6> row{};if(!numbers(matrix[o],-4,4,row)||!matrix[o])return false;m.matrix[size_t(o)]=row;}
+    }
+    for(NSString* field in @[@"dominant",@"translation",@"rotation",@"orbit",@"led"])if(v[field]&&!boolean(v[field]))return false;
+    if(!text(v[@"name"],128)||!text(v[@"lock"],16))return false;
+    m.lock=[v[@"dominant"] boolValue]?Lock::dominant:Lock::none;
+    if(NSString* lock=v[@"lock"]){
+        NSUInteger index=[@[@"none",@"dominant",@"group"] indexOfObject:lock];if(index==NSNotFound)return false;
+        if(index||!v[@"dominant"])m.lock=Lock(index);
+    }
+    m.translation=v[@"translation"]?[v[@"translation"] boolValue]:true;
+    m.rotation=v[@"rotation"]?[v[@"rotation"] boolValue]:true;
+    m.orbit=v[@"orbit"]?[v[@"orbit"] boolValue]:true;
+    p.led=v[@"led"]?[v[@"led"] boolValue]:true;
+    NSArray* buttons=v[@"buttons"];
+    if(!buttons)return true;
+    if(![buttons isKindOfClass:NSArray.class]||buttons.count>32)return false;
+    for(NSUInteger i=0;i<buttons.count;++i){NSDictionary* b=buttons[i];if(![b isKindOfClass:NSDictionary.class])return false;
+        int kinds=0;for(NSString* field in @[@"keyCode",@"command",@"action",@"macro",@"open",@"shell"])if(b[field])++kinds;
+        if(kinds>1)return false;
+        if(b[@"keyCode"]){if(!number(b[@"keyCode"]))return false;double key=[b[@"keyCode"] doubleValue];if(key<0||key>127||std::floor(key)!=key)return false;p.keys[i]=[b[@"keyCode"] intValue];}
+        if(b[@"modifiers"]){if(!number(b[@"modifiers"]))return false;double flags=[b[@"modifiers"] doubleValue];if(flags<0||flags>0xffffffff||std::floor(flags)!=flags)return false;p.modifiers[i]=[b[@"modifiers"] unsignedLongLongValue];}
+        if(!text(b[@"command"],4096)||!text(b[@"label"],128)||!text(b[@"open"],4096)||!text(b[@"shell"],4096))return false;
+        if(b[@"passthrough"]&&!boolean(b[@"passthrough"]))return false;
+        if(b[@"action"]){
+            if(![b[@"action"] isKindOfClass:NSString.class])return false;
+            NSUInteger action=NSNotFound;for(NSUInteger a=0;a<std::size(actionNames);++a)if([b[@"action"] isEqualToString:@(actionNames[a])])action=a;
+            if(action==NSNotFound)return false;p.actions[i]=Action(action);
+        }
+        if(NSString* open=b[@"open"])p.open[i]=open.UTF8String;
+        if(NSString* shell=b[@"shell"])p.shell[i]=shell.UTF8String;
+        if(id macro=b[@"macro"]){
+            if(![macro isKindOfClass:NSArray.class]||[macro count]>64)return false;
+            for(NSDictionary* step in macro){
+                if(![step isKindOfClass:NSDictionary.class])return false;
+                MacroStep s;
+                if(id key=step[@"keyCode"]){double k=number(key)?[key doubleValue]:-1;if(k<0||k>127||std::floor(k)!=k)return false;s.type=MacroStep::Type::key;s.key=int(k);
+                    if(id flags=step[@"modifiers"]){if(!number(flags)||[flags doubleValue]<0||[flags doubleValue]>0xffffffff)return false;s.modifiers=[flags unsignedLongLongValue];}}
+                else if(id value=step[@"text"]){if(!text(value,1024))return false;s.type=MacroStep::Type::text;s.text=[value UTF8String];}
+                else if(id delay=step[@"delay"]){if(!number(delay)||[delay doubleValue]<0||[delay doubleValue]>10000)return false;s.type=MacroStep::Type::delay;s.delay=uint32_t([delay doubleValue]);}
+                else return false;
+                if(!text(step[@"label"],128))return false;
+                p.macros[i].push_back(std::move(s));
+            }
+        }
+        // Commands reach applications through the native button event; never withhold them.
+        if(b[@"passthrough"]&&![b[@"passthrough"] boolValue]&&!b[@"command"])p.blocked|=1u<<i;
+    }
+    return true;
+}
 std::unique_ptr<Configuration> parseConfig(NSDictionary* d) {
     if(![d isKindOfClass:NSDictionary.class]||!number(d[@"version"])||![d[@"version"] isEqual:@1]||![d[@"profiles"] isKindOfClass:NSDictionary.class])return nullptr;
     NSDictionary* profiles=d[@"profiles"];if(profiles.count>128)return nullptr;
@@ -351,38 +532,8 @@ std::unique_ptr<Configuration> parseConfig(NSDictionary* d) {
         if(![key isKindOfClass:NSString.class]||key.length==0||key.length>255)return nullptr;
         NSDictionary* v=profiles[key];if(![v isKindOfClass:NSDictionary.class])return nullptr;
         Profile p;
-        for(NSString* field in @[@"gain",@"deadzone",@"invert"]){
-            NSArray* a=v[field];if(!a)continue;
-            if(![a isKindOfClass:NSArray.class]||a.count!=6)return nullptr;
-            for(int i=0;i<6;++i){if([field isEqual:@"invert"]?!boolean(a[i]):!number(a[i]))return nullptr;
-                double x=[a[i] doubleValue];
-                if([field isEqual:@"gain"]){if(x<0||x>20)return nullptr;p.motion.gain[i]=x;}
-                else if([field isEqual:@"deadzone"]){if(x<0||x>1000)return nullptr;p.motion.deadzone[i]=x;}
-                else p.motion.invert[i]=[a[i] boolValue];
-            }
-        }
-        for(NSString* field in @[@"dominant",@"translation",@"rotation",@"orbit",@"led"]){
-            if(v[field]&&!boolean(v[field]))return nullptr;
-        }
-        p.motion.dominant=[v[@"dominant"] boolValue];
-        p.motion.translation=v[@"translation"]?[v[@"translation"] boolValue]:true;
-        p.motion.rotation=v[@"rotation"]?[v[@"rotation"] boolValue]:true;
-        p.motion.orbit=v[@"orbit"]?[v[@"orbit"] boolValue]:true;
-        p.led=v[@"led"]?[v[@"led"] boolValue]:true;
+        if(!parseProfile(v,p))return nullptr;
         NSArray* buttons=v[@"buttons"];
-        if(buttons){if(![buttons isKindOfClass:NSArray.class]||buttons.count>32)return nullptr;
-            for(NSUInteger i=0;i<buttons.count;++i){NSDictionary* b=buttons[i];if(![b isKindOfClass:NSDictionary.class])return nullptr;
-                if(b[@"keyCode"]){if(!number(b[@"keyCode"]))return nullptr;double key=[b[@"keyCode"] doubleValue];if(key<0||key>127||std::floor(key)!=key)return nullptr;p.keys[i]=[b[@"keyCode"] intValue];}
-                if(b[@"modifiers"]){if(!number(b[@"modifiers"]))return nullptr;double flags=[b[@"modifiers"] doubleValue];if(flags<0||flags>0xffffffff||std::floor(flags)!=flags)return nullptr;p.modifiers[i]=[b[@"modifiers"] unsignedLongLongValue];}
-                if(b[@"command"]&&(![b[@"command"] isKindOfClass:NSString.class]||[b[@"command"] length]>4096||b[@"keyCode"]))return nullptr;
-                if(b[@"label"]&&(![b[@"label"] isKindOfClass:NSString.class]||[b[@"label"] length]>128))return nullptr;
-                if(b[@"action"]){
-                    if(![b[@"action"] isKindOfClass:NSString.class]||b[@"keyCode"]||b[@"command"])return nullptr;
-                    NSArray* actions=@[@"",@"dominant",@"translation",@"rotation",@"faster",@"slower",@"fit"];
-                    NSUInteger action=[actions indexOfObject:b[@"action"]];if(action==NSNotFound)return nullptr;p.actions[i]=Action(action);
-                }
-            }
-        }
         std::array<std::string,32> commands{};
         if(buttons)for(NSUInteger i=0;i<buttons.count;++i){NSString* command=buttons[i][@"command"];if(command)commands[i]=command.UTF8String;}
         c->web.commands.emplace(key.UTF8String,std::move(commands));
@@ -393,12 +544,15 @@ std::unique_ptr<Configuration> parseConfig(NSDictionary* d) {
 NSDictionary* status() {
     __block Snapshot snapshot;
     __block NSString* bundle;
+    __block NSString* active;
+    __block NSString* previewing;
     dispatch_sync(inputQueue,^{
         for(const auto& h:hidDevices)if(h.device&&snapshot.count<16){size_t i=snapshot.count++;snapshot.latest[i]=h.decoder.state;snapshot.ledSupported[i]=bool(h.led);snapshot.ledState[i]=h.led?h.led->state.load():-1;snapshot.ledError[i]=h.led?h.led->error.load():0;}
         for(const auto& e:virtualDevices)if(e.device&&snapshot.count<16)snapshot.latest[snapshot.count++]=e;
         for(const auto& p:peers)if(p.fd>=0&&p.registered)++snapshot.clients;
         snapshot.reports=reports;snapshot.overflows=overflows;snapshot.rejected=rejected;snapshot.foreground=foregroundPID;
         bundle=[NSString stringWithUTF8String:foregroundBundle.c_str()];
+        active=@(activeKey.c_str());previewing=@(previewKey.c_str());
     });
     NSMutableArray* items=[NSMutableArray array];
     for(size_t i=0;i<snapshot.count;++i){const auto& e=snapshot.latest[i];auto spec=deviceSpec(e.vendor,e.product);
@@ -411,7 +565,7 @@ NSDictionary* status() {
     double cpu=usage.ru_utime.tv_sec+usage.ru_stime.tv_sec+(usage.ru_utime.tv_usec+usage.ru_stime.tv_usec)/1e6;
     auto webText=webServer->status();NSData* webData=[NSData dataWithBytes:webText.data() length:webText.size()];
     id web=[NSJSONSerialization JSONObjectWithData:webData options:0 error:nil];
-    return @{@"version":@1,@"mock":@(mockMode),@"devices":items,@"clients":@(snapshot.clients),@"reports":@(snapshot.reports),@"overflows":@(snapshot.overflows),@"rejected":@(snapshot.rejected),@"foregroundPID":@(snapshot.foreground),@"foregroundApp":bundle?:@"",@"accessibility":@(bool(AXIsProcessTrusted())),@"residentBytes":@(memory.resident_size),@"cpuSeconds":@(cpu),@"web":web?:@{}};
+    return @{@"version":@1,@"mock":@(mockMode),@"devices":items,@"clients":@(snapshot.clients),@"reports":@(snapshot.reports),@"overflows":@(snapshot.overflows),@"rejected":@(snapshot.rejected),@"foregroundPID":@(snapshot.foreground),@"foregroundApp":bundle?:@"",@"activeProfile":active?:@"",@"previewProfile":previewing?:@"",@"accessibility":@(bool(AXIsProcessTrusted())),@"residentBytes":@(memory.resident_size),@"cpuSeconds":@(cpu),@"web":web?:@{}};
 }
 NSDictionary* handle(NSDictionary* request) {
     NSString* op=request[@"op"];
@@ -422,6 +576,14 @@ NSDictionary* handle(NSDictionary* request) {
         return @{@"trusted":@(trusted)};
     }
     if([op isEqual:@"stop"]){dispatch_async(dispatch_get_main_queue(),^{kill(getpid(),SIGTERM);});return @{@"ok":@YES};}
+    if([op isEqual:@"preview"]){
+        // The settings app mirrors this profile to mapped monitors while editing it.
+        NSString* key=request[@"profile"];
+        if(key&&![key isKindOfClass:NSString.class])return @{@"error":@"Invalid preview profile"};
+        std::string value=key?key.UTF8String:"";if(value.size()>255)return @{@"error":@"Invalid preview profile"};
+        dispatch_sync(inputQueue,^{if(previewKey!=value){previewKey=value;selectProfile();}});
+        return @{@"ok":@YES};
+    }
     if([op isEqual:@"getConfig"])return document;
     if([op isEqual:@"getCommands"])return commandCatalog;
     if([op isEqual:@"commands"]){NSString* app=request[@"app"];NSArray* commands=request[@"commands"];
@@ -503,6 +665,7 @@ int main(int argc,char** argv) {@autoreleasepool {
     if(events<0||controls<0){perror("listen");return 1;}
     inputQueue=dispatch_queue_create("pro.jest.input",dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL,QOS_CLASS_USER_INTERACTIVE,0));
     keyQueue=dispatch_queue_create("pro.jest.shortcuts",DISPATCH_QUEUE_SERIAL);
+    macroQueue=dispatch_queue_create("pro.jest.macros",DISPATCH_QUEUE_SERIAL);
     outputQueue=dispatch_queue_create("pro.jest.output",dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL,QOS_CLASS_UTILITY,0));
     keySource=dispatch_source_create(DISPATCH_SOURCE_TYPE_DATA_ADD,0,0,keyQueue);
     dispatch_source_set_event_handler(keySource,^{drainKeys();});dispatch_resume(keySource);

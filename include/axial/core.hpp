@@ -11,7 +11,9 @@
 namespace sn {
 constexpr uint32_t magic = 0x534e4156;
 enum class Kind : uint16_t { hello = 1, motion, buttons, added, removed, reset, command };
-enum Flags : uint32_t { monitor = 1, replay = 2, orbit = 4, disconnected = 8 };
+// mapped: hello flag for monitors that also want the post-mapping stream.
+// processed: marks a mirrored, post-mapping copy delivered to such monitors.
+enum Flags : uint32_t { monitor = 1, replay = 2, orbit = 4, disconnected = 8, mapped = 16, processed = 32 };
 // Local little-endian ABI, identical on macOS arm64 and x86_64. No pointers.
 struct Event {
     uint32_t magicValue = magic;
@@ -117,13 +119,23 @@ template<size_t N> class EventQueue {
     std::array<Event,N> data{};
     size_t head=0, count=0;
 public:
-    bool push(const Event& e) noexcept {
+    // protectFront: the front frame is partly written and must not be replaced.
+    bool push(const Event& e, bool protectFront=false) noexcept {
         if (count && e.kind==Kind::motion) {
-            auto& last=data[(head+count-1)%N];
             bool neutral=std::all_of(e.axes.begin(),e.axes.end(),[](int v){return v==0;});
-            bool previousNeutral=std::all_of(last.axes.begin(),last.axes.end(),[](int v){return v==0;});
-            if (!neutral && !previousNeutral && last.kind==e.kind && last.device==e.device) {
-                last=e; return true;
+            // Look back over at most one interleaved motion frame of the other
+            // stream (raw vs processed) so mapped monitors still coalesce.
+            for (size_t back=1; back<=std::min<size_t>(2,count); ++back) {
+                size_t index=(head+count-back)%N;
+                auto& last=data[index];
+                if (last.kind!=Kind::motion||last.device!=e.device) break;
+                bool previousNeutral=std::all_of(last.axes.begin(),last.axes.end(),[](int v){return v==0;});
+                if ((last.flags&Flags::processed)!=(e.flags&Flags::processed)) {
+                    if (previousNeutral) break; // neutral frames are barriers
+                    continue;
+                }
+                if (!neutral && !previousNeutral && !(protectFront && index==head)) {last=e; return true;}
+                break;
             }
         }
         if (count==N) return false;

@@ -2,41 +2,6 @@ import SwiftUI
 import AppKit
 import ServiceManagement
 
-struct ButtonAction: Codable, Equatable {
-    var keyCode: Int? = nil
-    var modifiers: UInt64? = nil
-    var command: String? = nil
-    var action: String? = nil
-    var label: String? = nil
-}
-struct Profile: Codable, Equatable {
-    var gain: [Double] = Array(repeating: 1, count: 6)
-    var deadzone: [Double] = Array(repeating: 0, count: 6)
-    var invert: [Bool] = Array(repeating: false, count: 6)
-    var dominant = false
-    var translation = true
-    var rotation = true
-    var orbit = true
-    var led = true
-    var buttons: [ButtonAction] = Array(repeating: ButtonAction(), count: 32)
-    init() {}
-    init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        gain = try c.decodeIfPresent([Double].self, forKey: .gain) ?? gain
-        deadzone = try c.decodeIfPresent([Double].self, forKey: .deadzone) ?? deadzone
-        invert = try c.decodeIfPresent([Bool].self, forKey: .invert) ?? invert
-        dominant = try c.decodeIfPresent(Bool.self, forKey: .dominant) ?? dominant
-        translation = try c.decodeIfPresent(Bool.self, forKey: .translation) ?? translation
-        rotation = try c.decodeIfPresent(Bool.self, forKey: .rotation) ?? rotation
-        orbit = try c.decodeIfPresent(Bool.self, forKey: .orbit) ?? orbit
-        led = try c.decodeIfPresent(Bool.self, forKey: .led) ?? led
-        buttons = try c.decodeIfPresent([ButtonAction].self, forKey: .buttons) ?? buttons
-        buttons += Array(repeating: ButtonAction(), count: max(0, 32 - buttons.count))
-        guard gain.count == 6, deadzone.count == 6, invert.count == 6, buttons.count == 32 else {
-            throw DecodingError.dataCorrupted(.init(codingPath: decoder.codingPath, debugDescription: "Invalid profile dimensions"))
-        }
-    }
-}
 struct WebConfiguration: Codable {
     var enabled = true
 }
@@ -53,6 +18,7 @@ struct Status: Codable {
     var web: WebStatus? = nil
     var devices: [Device]; var clients: Int; var reports: UInt64; var overflows: UInt64
     var rejected: UInt64; var foregroundApp: String; var accessibility: Bool; var mock: Bool
+    var activeProfile: String? = nil; var previewProfile: String? = nil
     var connectedClients: Int {clients + (web?.connections ?? 0)}
 }
 struct AppCommand: Codable, Identifiable {var id: String; var label: String}
@@ -61,7 +27,7 @@ struct AppCommand: Codable, Identifiable {var id: String; var label: String}
     let webSetup = WebSetupCoordinator(operations: NativeWebSetup(helper: Bundle.main.bundleURL.appendingPathComponent("Contents/Library/Helpers/axial-web-setup")))
     @Published var status: Status?
     @Published var config = Configuration()
-    @Published var selected = "*"
+    @Published var selected = "*" {didSet {if selected != oldValue {syncPreview()}}}
     @Published var message = "Connecting to Axial…"
     @Published var commands: [String: [AppCommand]] = [:]
     @Published private(set) var configurationReady = false
@@ -92,10 +58,12 @@ struct AppCommand: Codable, Identifiable {var id: String; var label: String}
     private var saveInFlight = false
     private var saveWaiters: [CheckedContinuation<Void, Never>] = []
     private var appNames: [String: String] = [:]
+    let live: Bool
+    private var previewSent: String?
     var hasUnsavedChanges: Bool {editRevision != savedRevision}
 
     init(live: Bool = true, client: any ServiceRequesting = ServiceClient(), launcher: (any ServiceLaunching)? = nil) {
-        self.client = client
+        self.client = client;self.live = live
         self.launcher = launcher ?? (live ? NativeServiceLauncher() : nil)
         guard live else {configurationReady = true;return}
         previewStart();ownsPreview = true
@@ -132,6 +100,7 @@ struct AppCommand: Codable, Identifiable {var id: String; var label: String}
                 } else if self?.status == nil {self?.ensureServiceRunning()}
                 if self?.status != nil {
                     if self?.loaded == false {await self?.load()}
+                    if self?.live == true && self?.status?.previewProfile != self?.selected {self?.previewSent = nil;self?.syncPreview()}
                     if self?.hasUnsavedChanges == true {await self?.save()}
                     if count % 3 == 0 {await self?.loadCommands()}
                     if count % 5 == 0 {await self?.refreshWebSetup()}
@@ -225,7 +194,7 @@ struct AppCommand: Codable, Identifiable {var id: String; var label: String}
         var p = profile; change(&p); config.profiles[selected] = p;editRevision += 1
         saveTask?.cancel()
         saveTask = Task { [weak self] in
-            do {try await Task.sleep(nanoseconds: 250_000_000)} catch {return}
+            do {try await Task.sleep(nanoseconds: 60_000_000)} catch {return}
             await self?.save()
         }
     }
@@ -344,6 +313,61 @@ struct AppCommand: Codable, Identifiable {var id: String; var label: String}
         Task {await save()}
     }
     func addProfile(_ id: String) {guard configurationReady else {return};config.profiles[id] = config.profiles[id] ?? config.profiles["*"] ?? Profile(); selected = id; edit {_ in}}
+    /// Ask the service to mirror the edited profile's real pipeline output to
+    /// this app's monitor stream (Live view), independent of the foreground app.
+    func syncPreview() {
+        guard live, !stopped, previewSent != selected else {return}
+        previewSent = selected
+        let client = self.client
+        let body = (try? JSONSerialization.data(withJSONObject: ["op": "preview", "profile": selected])).flatMap {String(data: $0, encoding: .utf8)} ?? ""
+        Task {_ = await client.request(body)}
+    }
+    func addPreset(_ preset: AppPreset) {
+        guard configurationReady else {return}
+        if config.profiles[preset.id] == nil {
+            var p = config.profiles["*"] ?? Profile();preset.configure(&p);config.profiles[preset.id] = p
+        }
+        selected = preset.id;edit {_ in}
+    }
+    /// Copy the selected profile to another key (application bundle id, optionally @device).
+    func duplicateSelected(to key: String, name: String? = nil) {
+        guard configurationReady, !key.isEmpty else {return}
+        var copy = profile;copy.name = name ?? copy.name.map {"\($0) copy"}
+        config.profiles[key] = copy;selected = key;edit {_ in}
+    }
+    func duplicateToApplication() {
+        let panel = NSOpenPanel();panel.directoryURL = URL(fileURLWithPath: "/Applications");panel.canChooseDirectories = false;panel.allowedContentTypes = [.application]
+        panel.message = "Choose the application that should use a copy of “\(profileName(selected))”."
+        if panel.runModal() == .OK, let url = panel.url, let id = Bundle(url: url)?.bundleIdentifier {
+            let runningID = NSWorkspace.shared.runningApplications.first(where: {$0.bundleURL == url})?.bundleIdentifier ?? id
+            duplicateSelected(to: runningID, name: url.deletingPathExtension().lastPathComponent)
+        }
+    }
+    func exportProfiles(all: Bool) {
+        let panel = NSSavePanel();panel.allowedContentTypes = [.json]
+        panel.nameFieldStringValue = all ? "SpaceControl-profiles.json" : "\(profileName(selected).replacingOccurrences(of: "/", with: "-")).spacecontrol.json"
+        guard panel.runModal() == .OK, let url = panel.url else {return}
+        let profiles = all ? config.profiles : [selected: profile]
+        let encoder = JSONEncoder();encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        do {try encoder.encode(ProfileBundle(profiles: profiles)).write(to: url, options: .atomic);message = "Exported \(profiles.count) profile(s)."}
+        catch {message = "Could not export: \(error.localizedDescription)"}
+    }
+    /// Import a SpaceControl bundle, a full Axial settings.json, or a bare profile object.
+    func importProfiles() {
+        let panel = NSOpenPanel();panel.allowedContentTypes = [.json];panel.allowsMultipleSelection = false
+        guard configurationReady, panel.runModal() == .OK, let url = panel.url else {return}
+        do {
+            let data = try Data(contentsOf: url)
+            var imported: [String: Profile] = [:]
+            if let bundle = try? JSONDecoder().decode(ProfileBundle.self, from: data), bundle.format == "axial-spacecontrol-profiles" {imported = bundle.profiles}
+            else if let settings = try? JSONDecoder().decode(Configuration.self, from: data) {imported = settings.profiles}
+            else {imported = [selected: try JSONDecoder().decode(Profile.self, from: data)]}
+            guard !imported.isEmpty, imported.count <= 128 else {message = "No profiles found in \(url.lastPathComponent).";return}
+            for (key, value) in imported {config.profiles[key] = value}
+            selected = imported.keys.sorted().first ?? selected;edit {_ in}
+            message = "Imported \(imported.count) profile(s) from \(url.lastPathComponent)."
+        } catch {message = "Could not import: \(error.localizedDescription)"}
+    }
     func profileName(_ key: String) -> String {
         let parts = key.split(separator: "@", maxSplits: 1).map(String.init)
         guard let id = parts.first else {return "Profile"}
@@ -351,6 +375,7 @@ struct AppCommand: Codable, Identifiable {var id: String; var label: String}
         if id == "*" {name = "All applications"}
         else if id == "com.autodesk.fusion360" {name = "Autodesk Fusion"}
         else if id.hasPrefix("com.prusa3d.slic3r") {name = "PrusaSlicer"}
+        else if let preset = AppPreset.all.first(where: {$0.id == id}) {name = preset.title}
         else if let cached = appNames[id] {name = cached}
         else if let app = NSWorkspace.shared.runningApplications.first(where: {$0.bundleIdentifier == id}), let title = app.localizedName {name = title}
         else if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: id) {name = url.deletingPathExtension().lastPathComponent}
@@ -386,167 +411,6 @@ struct KeyRecorder: NSViewRepresentable {
             record?(Int(event.keyCode), UInt64(flags.rawValue), prefix + key)
         }
         override func performKeyEquivalent(with event: NSEvent) -> Bool {keyDown(with: event);return true}
-    }
-}
-struct SettingsView: View {
-    @EnvironmentObject var model: Model
-    private let axes = ["Left / right", "Near / far", "Up / down", "Tilt", "Roll", "Spin"]
-    var body: some View {
-        HSplitView {
-            VStack(alignment: .leading, spacing: 16) {
-                HStack(spacing: 10) {Image(nsImage: NSApp.applicationIconImage).resizable().frame(width: 36, height: 36);Text("Axial").font(.title.bold())}
-                Label(model.status == nil ? "Service stopped" : "Service running", systemImage: model.status == nil ? "circle" : "checkmark.circle.fill").foregroundStyle(model.status == nil ? Color.secondary : Color.green)
-                Divider()
-                Text("APPLICATION PROFILE").font(.caption).foregroundStyle(.secondary)
-                NativePopup(label: "Profile", selection: model.selected,
-                    choices: model.config.profiles.keys.sorted().map {PopupChoice($0, model.profileName($0))}, height: 30) {model.selected = $0}
-                    .frame(maxWidth: .infinity).sidebarSurface()
-                NativePopup(label: "Add application profile", choices: [
-                    PopupChoice("com.autodesk.fusion360", "Autodesk Fusion"),
-                    PopupChoice("com.prusa3d.slic3r.", "PrusaSlicer"),
-                    PopupChoice("choose", "Choose application…")
-                ], actionMenu: true, height: 30) {id in
-                    if id == "choose" {model.addApplication()} else {model.addProfile(id)}
-                }.frame(maxWidth: .infinity).sidebarSurface().disabled(!model.configurationReady)
-                if let d = model.device, !model.selected.contains("@") {
-                    SidebarButton(title: "Customize for this device") {
-                        let key = model.selected + String(format: "@%04x:%04x", d.vendor, d.product)
-                        model.config.profiles[key] = model.profile;model.selected = key;model.edit {_ in}
-                    }.frame(maxWidth: .infinity).sidebarSurface().disabled(!model.configurationReady)
-                }
-                if model.selected != "*" {
-                    SidebarButton(title: "Remove override") {
-                        model.removeSelectedProfile()
-                    }.frame(maxWidth: .infinity).sidebarSurface().disabled(!model.configurationReady)
-                }
-                Divider()
-                if let device = model.device {
-                    Label(device.displayName, systemImage: "cable.connector").font(.headline)
-                    Label("USB connected", systemImage: "checkmark.circle.fill").foregroundStyle(Color.green)
-                    if (model.status?.devices.count ?? 0) > 1 {
-                        NativePopup(label: "Device", selection: String(model.device?.id ?? 0),
-                            choices: (model.status?.devices ?? []).map {PopupChoice(String($0.id), $0.displayName)}, height: 30) {model.recording = nil;model.selectedDevice = Int($0)}
-                            .frame(maxWidth: .infinity).sidebarSurface()
-                    }
-                } else {Text("Connect a supported USB controller.").foregroundStyle(.secondary)}
-                Spacer()
-            }.padding(18).frame(minWidth: 230, idealWidth: 240, maxWidth: 280, maxHeight: .infinity, alignment: .topLeading)
-
-            VStack(alignment: .leading) {
-                Picker("Settings", selection: $model.tab) {Text("Motion").tag(0);Text("Buttons").tag(1);Text("Test").tag(2);Text("Service & diagnostics").tag(3)}.pickerStyle(.segmented).labelsHidden().accessibilityLabel("Settings tabs")
-                Group {
-                    if model.tab == 0 {motion.disabled(!model.configurationReady)}
-                    else if model.tab == 1 {buttons.disabled(!model.configurationReady)}
-                    else if model.tab == 2 {TestTab().environmentObject(model)}
-                    else {service}
-                }.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading).padding(12).contentSurface()
-                if !model.message.isEmpty {
-                    Divider()
-                    Text(model.message).font(.caption).foregroundStyle(.secondary).textSelection(.enabled).lineLimit(2)
-                }
-            }.padding(12).frame(minWidth: 780)
-        }.frame(minWidth: 1080, minHeight: 740)
-            .groupBoxStyle(AxialGroupBoxStyle()).buttonStyle(.bordered).controlSize(.regular)
-    }
-    var motion: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("Motion").font(.title2.bold())
-            if let error = model.device?.ledError, error != 0 {Text("The controller rejected the LED change (\(String(error, radix: 16))).").font(.caption).foregroundStyle(.orange)}
-            HStack(spacing: 12) {
-                Toggle("Translation", isOn: Binding(get: {model.profile.translation}, set: {x in model.edit {$0.translation = x}}))
-                Toggle("Rotation", isOn: Binding(get: {model.profile.rotation}, set: {x in model.edit {$0.rotation = x}}))
-                Toggle("Dominant axis", isOn: Binding(get: {model.profile.dominant}, set: {x in model.edit {$0.dominant = x}}))
-                Toggle("LED illumination", isOn: Binding(get: {model.profile.led}, set: {x in model.edit {$0.led = x}})).disabled(model.device?.ledSupported == false)
-                Spacer(minLength: 8)
-                HStack(spacing: 8) {
-                    Text("Navigation")
-                    NativePopup(label: "Navigation", selection: model.profile.orbit ? "orbit" : "camera", choices: [PopupChoice("orbit", "Orbit around target"), PopupChoice("camera", "Move camera")]) {choice in model.edit {$0.orbit = choice == "orbit"}}
-                        .popupSurface()
-                }.frame(width: 230)
-            }
-            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
-            ForEach(0..<6, id: \.self) {i in
-                GroupBox {
-                    VStack(alignment: .leading, spacing: 5) {
-                        HStack {Text(axes[i]).font(.headline);Spacer();Text("\(model.device?.axes[safe: i] ?? 0)").monospacedDigit().foregroundStyle(.secondary)}
-                        AxisMeter(value: model.device?.axes[safe: i] ?? 0, label: axes[i])
-                        HStack {Text("Speed").frame(width: 60, alignment: .leading);Slider(value: Binding(get: {model.profile.gain[i]}, set: {x in model.edit {$0.gain[i] = x}}), in: 0...5);Text(model.profile.gain[i], format: .number.precision(.fractionLength(2))).monospacedDigit().frame(width: 35)}
-                        HStack {Text("Deadzone").frame(width: 60, alignment: .leading);Slider(value: Binding(get: {model.profile.deadzone[i]}, set: {x in model.edit {$0.deadzone[i] = x}}), in: 0...100);Toggle("Invert", isOn: Binding(get: {model.profile.invert[i]}, set: {x in model.edit {$0.invert[i] = x}}))}
-                    }.font(.callout).padding(4)
-                }
-            }
-            }
-            Button("Reset this profile") {model.edit {$0 = Profile()}}
-            Spacer(minLength: 0)
-        }
-    }
-    var buttons: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack {
-                Text("Buttons").font(.title2.bold())
-                Spacer()
-                if let device = model.device, let layout = device.layout {
-                    Text("\(device.displayName) · \(layout.buttons.count) buttons").foregroundStyle(.secondary)
-                }
-            }
-            if model.device?.layout == nil {
-                Text(model.device == nil ? "Connect a controller to configure its buttons." : "Button layout is unavailable for this controller.").foregroundStyle(.secondary)
-            }
-            ScrollView {
-            LazyVStack(spacing: 10) {
-            ForEach(model.device?.layout?.buttons ?? []) {button in
-                let i = button.id
-                GroupBox { VStack(alignment: .leading, spacing: 10) {
-                    HStack {
-                        Circle().fill(((model.device?.buttons ?? 0) & (1 << i)) != 0 ? Color.green : Color.secondary.opacity(0.2)).frame(width: 10, height: 10)
-                        Text(button.name).font(.headline)
-                        Spacer()
-                        if model.recording == i {
-                            Text("Press shortcut…").foregroundStyle(.tint).background(KeyRecorder {key, flags, label in model.edit {$0.buttons[i] = ButtonAction(keyCode: key, modifiers: flags, label: label)};model.recording = nil}.frame(width: 1, height: 1))
-                            Button("Cancel") {model.recording = nil}
-                        } else {Button(model.profile.buttons[i].keyCode == nil ? "Record shortcut" : (model.profile.buttons[i].label ?? "Replace shortcut")) {model.recording = i}}
-                        Button {model.edit {$0.buttons[i] = ButtonAction()}} label: {Image(systemName: "xmark.circle")}.buttonStyle(.borderless).accessibilityLabel("Clear assignment for \(button.name)").help("Clear assignment")
-                    }
-                    HStack(spacing: 12) {
-                    Text("Command").frame(width: 90, alignment: .leading)
-                    NativePopup(label: "Command", selection: model.profile.buttons[i].command ?? "",
-                        choices: [PopupChoice("", "No app command")] + (model.commands[String(model.selected.split(separator: "@").first ?? "*")] ?? []).map {PopupChoice($0.id, $0.label)}) {x in
-                            model.edit {$0.buttons[i] = ButtonAction(command: x.isEmpty ? nil : x)}
-                        }.popupSurface().frame(width: 320)
-                    Spacer(minLength: 0)
-                    }
-                    HStack(spacing: 12) {
-                    Text("Driver action").frame(width: 90, alignment: .leading)
-                    NativePopup(label: "Driver action", selection: model.profile.buttons[i].action ?? "", choices: [
-                        PopupChoice("", "No driver action"), PopupChoice("dominant", "Toggle dominant axis"),
-                        PopupChoice("translation", "Toggle translation"), PopupChoice("rotation", "Toggle rotation"),
-                        PopupChoice("faster", "Increase speed"), PopupChoice("slower", "Decrease speed"), PopupChoice("fit", "Fit view")
-                    ]) {x in model.edit {$0.buttons[i] = ButtonAction(action: x.isEmpty ? nil : x)}}.popupSurface().frame(width: 320)
-                    Spacer(minLength: 0)
-                    }
-                }.padding(6) }
-            }
-            }.padding(.vertical, 2).padding(.trailing, 8)
-            }.scrollContentBackground(.hidden).clipShape(RoundedRectangle(cornerRadius: 12))
-        }
-    }
-    var service: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack {Text("Service & diagnostics").font(.title2.bold());Spacer();Button("Export…", action: model.exportDiagnostics)}
-            HStack {Spacer();Toggle("Start at login", isOn: Binding(get: {model.launchAtLogin}, set: {model.login($0)}))}
-            GroupBox("Permissions") {
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack {
-                        Label(model.status?.accessibility == true ? "Keyboard shortcuts enabled" : "Keyboard shortcuts need permission", systemImage: "keyboard");Spacer()
-                        Button(action: model.requestAccessibility) {Text("Accessibility…").frame(width: 145)}.disabled(model.status == nil)
-                    }
-                }.frame(maxWidth: .infinity, alignment: .leading).padding(6)
-            }
-            DiagnosticsCharts(samples: model.diagnostics.samples).equatable()
-            WebCompatibilityView(model: model, setup: model.webSetup)
-            if model.status?.mock == true {Label("Mock input service", systemImage: "testtube.2").foregroundStyle(.orange)}
-            Spacer(minLength: 0)
-        }
     }
 }
 struct WebCompatibilityView: View {
